@@ -27,7 +27,7 @@ import matplotlib.ticker as mticker
 import matplotlib.dates as mdates
 
 from tracker_core import (
-    APP_TITLE, APP_VERSION, DEFAULT_THRESHOLD,
+    APP_TITLE, APP_VERSION, DEFAULT_THRESHOLD, DUPLICATE_GAP_MINUTES,
     COL_ID, COL_TIMESTAMP, COL_SESSION, COL_NAME, COL_EMAIL, COL_IP, COL_UA, COL_REG_IP,
     COL_ENTRY_ID, COL_DATE_UPDATED, COL_SOURCE_URL, COL_CREATED_BY, COL_SUBMISSION_SPEED,
     COL_PHONE, COL_YEAR, COL_UNIVERSITY,
@@ -186,7 +186,9 @@ class TrackerApp(ctk.CTk):
             self.nav_buttons[key] = btn
 
         ctk.CTkLabel(self.sidebar, text="─" * 24, text_color="gray40").pack(pady=(10, 4))
-        ctk.CTkLabel(self.sidebar, text="Threshold", font=ctk.CTkFont(size=12)).pack()
+        ctk.CTkLabel(self.sidebar, text="Other Sessions", font=ctk.CTkFont(size=12)).pack()
+        ctk.CTkLabel(self.sidebar, text="(beyond Opening + Closing)",
+                     font=ctk.CTkFont(size=9), text_color="gray50").pack()
         tf = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         tf.pack(pady=4)
         self.threshold_var = ctk.StringVar(value=str(self.threshold))
@@ -449,13 +451,14 @@ class TrackerApp(ctk.CTk):
         fig, ax = plt.subplots(figsize=(10, 4))
         mx = int(counts.max())
         hv = [int((counts == b).sum()) for b in range(1, mx + 1)]
-        cols = [CHART_ACCENT if b >= self.threshold else CHART_WARN for b in range(1, mx + 1)]
+        min_total = self.threshold + 2  # ceremonies + others
+        cols = [CHART_ACCENT if b >= min_total else CHART_WARN for b in range(1, mx + 1)]
         ax.bar(range(1, mx + 1), hv, color=cols, width=0.7)
-        ax.axvline(x=self.threshold - 0.5, color=CHART_ACCENT2, linestyle="--", linewidth=1.5,
-                   label=f"Threshold ({self.threshold})")
-        ax.set_xlabel("Sessions")
+        ax.axvline(x=min_total - 0.5, color=CHART_ACCENT2, linestyle="--", linewidth=1.5,
+                   label=f"Min total ({min_total}: Open+Close+{self.threshold})")
+        ax.set_xlabel("Attendances (valid)")
         ax.set_ylabel("Participants")
-        ax.set_title("Distribution")
+        ax.set_title("Attendance Distribution")
         ax.set_xticks(range(1, mx + 1))
         ax.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))
         ax.legend(facecolor=CHART_BG, edgecolor=CHART_GRID)
@@ -635,7 +638,10 @@ class TrackerApp(ctk.CTk):
         ie = self.store.ineligible_participants(t)
 
         if self.store.unique_participants:
-            self.el_sum.configure(text=f"Threshold: {t} • {len(e)}/{self.store.unique_participants} eligible")
+            self.el_sum.configure(
+                text=f"Opening + Closing + {t} others • "
+                     f"{len(e)}/{self.store.unique_participants} eligible"
+            )
         else:
             self.el_sum.configure(text="No data.")
 
@@ -643,7 +649,7 @@ class TrackerApp(ctk.CTk):
         tb = self.el_tbs["✅ Eligible"]
         self._tc(tb)
         if not e.empty:
-            self._tw(tb, f"  {'ID':<12}{'Name':<30}{'Email':<34}{'Sess':>6}\n  " + "─" * 84 + "\n")
+            self._tw(tb, f"  {'ID':<12}{'Name':<30}{'Email':<34}{'Att':>6}\n  " + "─" * 84 + "\n")
             for _, r in e.iterrows():
                 self._tw(tb, "  ")
                 self._make_id_clickable(tb, r[COL_ID])
@@ -659,13 +665,14 @@ class TrackerApp(ctk.CTk):
         tb = self.el_tbs["⏳ Not Yet"]
         self._tc(tb)
         if not ie.empty:
-            self._tw(tb, f"  {'ID':<12}{'Name':<30}{'Done':>6}{'Need':>6}\n  " + "─" * 56 + "\n")
+            self._tw(tb, f"  {'ID':<12}{'Name':<26}{'Att':>5}{'Need':>5}  {'Missing':<30}\n  " + "─" * 80 + "\n")
             for _, r in ie.iterrows():
                 self._tw(tb, "  ")
                 self._make_id_clickable(tb, r[COL_ID])
                 pad = max(0, 12 - len(str(r[COL_ID])))
-                self._tw(tb, f"{'':>{pad}}{str(r.get(COL_NAME, ''))[:28]:<30}"
-                              f"{r['sessions_attended']:>6}{r['sessions_remaining']:>6}\n")
+                missing = str(r.get("missing", ""))[:28]
+                self._tw(tb, f"{'':>{pad}}{str(r.get(COL_NAME, ''))[:24]:<26}"
+                              f"{r['sessions_attended']:>5}{r['sessions_remaining']:>5}  {missing:<30}\n")
         else:
             self._tw(tb, "\n   Everyone eligible! 🎉")
         self._tl(tb)
@@ -675,13 +682,29 @@ class TrackerApp(ctk.CTk):
         self._tc(tb)
         cn = self.store.session_count_per_participant().sort_values(ascending=False)
         if not cn.empty:
-            self._tw(tb, f"  {'ID':<12}{'Name':<30}{'Sess':>6}{'Status':>14}\n  " + "─" * 64 + "\n")
+            va = self.store._valid_attendances()
+            self._tw(tb, f"  {'ID':<12}{'Name':<26}{'Att':>5}{'Status':>28}\n  " + "─" * 73 + "\n")
             for pid, cnt in cn.items():
                 self._tw(tb, "  ")
                 self._make_id_clickable(tb, pid)
                 pad = max(0, 12 - len(str(pid)))
-                status = "✅" if cnt >= t else f"⏳ need {t - cnt}"
-                self._tw(tb, f"{'':>{pad}}{self.store.get_name(pid)[:28]:<30}{cnt:>6}{status:>14}\n")
+                cer = self.store.ceremony_status(pid)
+                pid_va = va[va[COL_ID] == pid] if not va.empty else pd.DataFrame()
+                others = sum(1 for s in pid_va[COL_SESSION] if not self.store._is_ceremony(s)) if not pid_va.empty else 0
+                is_elig = cer["opening"] and cer["closing"] and others >= t
+                if is_elig:
+                    status = "✅"
+                else:
+                    parts = []
+                    if not cer["opening"]:
+                        parts.append("Opening")
+                    if not cer["closing"]:
+                        parts.append("Closing")
+                    others_need = max(0, t - others)
+                    if others_need > 0:
+                        parts.append(f"+{others_need}")
+                    status = "⏳ " + ", ".join(parts)
+                self._tw(tb, f"{'':>{pad}}{self.store.get_name(pid)[:24]:<26}{cnt:>5}{status:>28}\n")
         else:
             self._tw(tb, "\n   No data.")
         self._tl(tb)
@@ -795,7 +818,17 @@ class TrackerApp(ctk.CTk):
 
         ns = r[COL_SESSION].nunique()
         ts = len(r)
-        el = ns >= self.threshold
+
+        # Use valid attendance count (time-aware deduplication)
+        va = self.store._valid_attendances()
+        pid_va = va[va[COL_ID] == pid] if not va.empty else pd.DataFrame()
+        n_attendances = len(pid_va)
+
+        # Ceremony-aware eligibility
+        ceremony = self.store.ceremony_status(pid)
+        others = sum(1 for s in pid_va[COL_SESSION] if not self.store._is_ceremony(s)) if not pid_va.empty else 0
+        el = ceremony["opening"] and ceremony["closing"] and others >= self.threshold
+
         name = self.store.get_name(pid)
         rip = self.store.get_reg_ip(pid)
         year = self.store.get_year(pid)
@@ -804,11 +837,15 @@ class TrackerApp(ctk.CTk):
 
         self.p_id.configure(text=f"ID: {pid}")
         self.p_name.configure(text=name or "No name")
+        cer_str = f"{'✅' if ceremony['opening'] else '❌'}Open {'✅' if ceremony['closing'] else '❌'}Close"
         if el:
-            self.p_st.configure(text=f"✅ ELIGIBLE • {ns} sess • {ts} scans", text_color="#10b981")
+            self.p_st.configure(
+                text=f"✅ ELIGIBLE • {n_attendances} att • {ts} scans • {cer_str}",
+                text_color="#10b981")
         else:
-            self.p_st.configure(text=f"⏳ {self.threshold - ns} more • {ns}/{self.threshold} • {ts} scans",
-                                text_color="#f59e0b")
+            self.p_st.configure(
+                text=f"⏳ {cer_str} • {others}/{self.threshold} others • {n_attendances} att • {ts} scans",
+                text_color="#f59e0b")
         detail_parts = []
         if year:
             detail_parts.append(f"Year: {year}")
@@ -821,16 +858,20 @@ class TrackerApp(ctk.CTk):
             text=f"Reg IP: {rip or 'N/A'} • Scan IPs: {', '.join(str(ip) for ip in r[COL_IP].unique())}"
         )
 
-        seen = set()
+        last_scan_ts: dict[str, datetime] = {}
         sched = self.store.schedule
         self._tw(self.p_tb,
                  f"  {'#':<4}{'Session':<28}{'IP':<18}{'Timestamp':>20}{'Timing':>12}{'Flags':>6}\n  "
                  + "─" * 90 + "\n")
         for i, (_, row) in enumerate(r.iterrows(), 1):
             flags = ""
-            if row[COL_SESSION] in seen:
-                flags += "⚠️"
-            seen.add(row[COL_SESSION])
+            sess = row[COL_SESSION]
+            ts_dt = pd.to_datetime(row[COL_TIMESTAMP], errors="coerce")
+            if sess in last_scan_ts and ts_dt is not pd.NaT:
+                if (ts_dt - last_scan_ts[sess]).total_seconds() <= DUPLICATE_GAP_MINUTES * 60:
+                    flags += "⚠️"
+            if ts_dt is not pd.NaT:
+                last_scan_ts[sess] = ts_dt
             if rip and str(row[COL_IP]).strip() != str(rip).strip():
                 flags += "🔀"
             timing = ""
@@ -848,7 +889,7 @@ class TrackerApp(ctk.CTk):
             self._tw(self.p_tb,
                      f"  {i:<4}{str(row[COL_SESSION])[:26]:<28}{str(row[COL_IP])[:16]:<18}"
                      f"{str(row[COL_TIMESTAMP])[:20]:>20}{timing:>12}{flags:>6}\n")
-        self._tw(self.p_tb, f"\n  ⚠️=dup  🔀=IP diff  🕐 OOW=out of time window")
+        self._tw(self.p_tb, f"\n  ⚠️=dup (<{DUPLICATE_GAP_MINUTES}min)  🔀=IP diff  🕐 OOW=out of time window")
         self._tl(self.p_tb)
 
         # Session dot chart
@@ -869,7 +910,7 @@ class TrackerApp(ctk.CTk):
         ax.invert_yaxis()
         ax.set_xticks([])
         ax.set_yticks([])
-        ax.set_title(f"{ns}/{len(all_s)} Sessions", fontsize=11)
+        ax.set_title(f"{n_attendances} attendance(s)", fontsize=11)
         for sp in ax.spines.values():
             sp.set_visible(False)
         fig.tight_layout()
@@ -911,13 +952,14 @@ class TrackerApp(ctk.CTk):
             self.dup_sum.configure(text="✅ None" if self.store.total_scans else "")
             self._tw(self.dup_tb, "\n   All clear." if self.store.total_scans else "\n   No data.")
         else:
-            self.dup_sum.configure(text=f"⚠️ {len(d)} duplicate(s)")
-            self._tw(self.dup_tb, f"  {'Session':<30}{'ID':<12}{'Name':<28}{'Scans':>6}\n  " + "─" * 78 + "\n")
+            self.dup_sum.configure(text=f"⚠️ {len(d)} participant–session pair(s) with duplicates")
+            self._tw(self.dup_tb, f"  {'Session':<30}{'ID':<12}{'Name':<28}{'Scans':>6}{'Dups':>6}\n  " + "─" * 84 + "\n")
             for _, r in d.iterrows():
                 self._tw(self.dup_tb, f"  {str(r[COL_SESSION])[:28]:<30}")
                 self._make_id_clickable(self.dup_tb, r[COL_ID])
                 pad = max(0, 12 - len(str(r[COL_ID])))
-                self._tw(self.dup_tb, f"{'':>{pad}}{self.store.get_name(r[COL_ID])[:26]:<28}{r['scan_count']:>6}\n")
+                self._tw(self.dup_tb, f"{'':>{pad}}{self.store.get_name(r[COL_ID])[:26]:<28}"
+                         f"{r['scan_count']:>6}{r['duplicate_count']:>6}\n")
         self._tl(self.dup_tb)
 
     # ══════════════════════════════════════════════════════════════════════

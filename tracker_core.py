@@ -35,7 +35,8 @@ import numpy as np
 
 APP_TITLE = "CAMeSM Attendance Tracker"
 APP_VERSION = "0.8.0"
-DEFAULT_THRESHOLD = 6
+DEFAULT_THRESHOLD = 4          # additional sessions beyond mandatory ceremonies
+DUPLICATE_GAP_MINUTES = 60     # scans within this window = duplicate; beyond = new attendance
 
 # ── Core column names (internal) ─────────────────────────────────────────
 COL_ID = "participant_id"
@@ -448,6 +449,54 @@ class AttendanceStore:
         self.records.loc[self.records[COL_SESSION] == old, COL_SESSION] = new
         self._log("RENAME", f"'{old}' → '{new}'")
 
+    # ── Attendance deduplication ──────────────────────────────────────────
+    @staticmethod
+    def _is_opening(session_name: str) -> bool:
+        return "opening" in session_name.lower()
+
+    @staticmethod
+    def _is_closing(session_name: str) -> bool:
+        return "closing" in session_name.lower()
+
+    @staticmethod
+    def _is_ceremony(session_name: str) -> bool:
+        return AttendanceStore._is_opening(session_name) or AttendanceStore._is_closing(session_name)
+
+    def _valid_attendances(self, gap_minutes: int = DUPLICATE_GAP_MINUTES) -> pd.DataFrame:
+        """
+        Deduplicate scans: for each (participant, session) group, scans within
+        `gap_minutes` of the previous scan are collapsed into one attendance.
+        Scans more than `gap_minutes` apart count as separate attendances
+        (e.g. Roundtables Hour 1 vs Hour 2).
+
+        Returns DataFrame with columns: [COL_ID, COL_SESSION, 'first_scan'].
+        """
+        if self.records.empty:
+            return pd.DataFrame(columns=[COL_ID, COL_SESSION, "first_scan"])
+
+        recs = self.records.copy()
+        recs["ts"] = pd.to_datetime(recs[COL_TIMESTAMP], errors="coerce")
+        recs = recs.dropna(subset=["ts"]).sort_values([COL_ID, COL_SESSION, "ts"])
+
+        attendances = []
+        for (pid, sess), group in recs.groupby([COL_ID, COL_SESSION]):
+            last_ts = None
+            for _, row in group.iterrows():
+                if last_ts is None or (row["ts"] - last_ts).total_seconds() > gap_minutes * 60:
+                    attendances.append({COL_ID: pid, COL_SESSION: sess, "first_scan": row["ts"]})
+                    last_ts = row["ts"]
+
+        return pd.DataFrame(attendances) if attendances else pd.DataFrame(columns=[COL_ID, COL_SESSION, "first_scan"])
+
+    def ceremony_status(self, pid: str) -> dict:
+        """Check whether a participant attended Opening and Closing ceremonies."""
+        va = self._valid_attendances()
+        pid_sessions = va.loc[va[COL_ID] == pid, COL_SESSION].tolist() if not va.empty else []
+        return {
+            "opening": any(self._is_opening(s) for s in pid_sessions),
+            "closing": any(self._is_closing(s) for s in pid_sessions),
+        }
+
     # ── Lookups ───────────────────────────────────────────────────────────
     @property
     def total_scans(self) -> int:
@@ -464,7 +513,10 @@ class AttendanceStore:
     def session_count_per_participant(self) -> pd.Series:
         if self.records.empty:
             return pd.Series(dtype=int)
-        return self.records.groupby(COL_ID)[COL_SESSION].nunique()
+        va = self._valid_attendances()
+        if va.empty:
+            return pd.Series(dtype=int)
+        return va.groupby(COL_ID).size()
 
     def _enrich(self, df: pd.DataFrame, cols: Optional[list] = None) -> pd.DataFrame:
         if self.registration is None or df.empty:
@@ -476,21 +528,62 @@ class AttendanceStore:
         return df
 
     def eligible_participants(self, threshold: int = DEFAULT_THRESHOLD) -> pd.DataFrame:
-        counts = self.session_count_per_participant()
-        if counts.empty:
+        va = self._valid_attendances()
+        if va.empty:
             return pd.DataFrame(columns=[COL_ID, "sessions_attended"])
-        result = counts[counts >= threshold].reset_index()
-        result.columns = [COL_ID, "sessions_attended"]
-        return self._enrich(result.sort_values("sessions_attended", ascending=False))
+        results = []
+        for pid, group in va.groupby(COL_ID):
+            sessions = group[COL_SESSION].tolist()
+            has_opening = any(self._is_opening(s) for s in sessions)
+            has_closing = any(self._is_closing(s) for s in sessions)
+            others = sum(1 for s in sessions if not self._is_ceremony(s))
+            if has_opening and has_closing and others >= threshold:
+                results.append({COL_ID: pid, "sessions_attended": len(sessions)})
+        result = pd.DataFrame(results) if results else pd.DataFrame(columns=[COL_ID, "sessions_attended"])
+        return self._enrich(result.sort_values("sessions_attended", ascending=False) if not result.empty else result)
 
     def ineligible_participants(self, threshold: int = DEFAULT_THRESHOLD) -> pd.DataFrame:
-        counts = self.session_count_per_participant()
-        if counts.empty:
-            return pd.DataFrame(columns=[COL_ID, "sessions_attended", "sessions_remaining"])
-        result = counts[counts < threshold].reset_index()
-        result.columns = [COL_ID, "sessions_attended"]
-        result["sessions_remaining"] = threshold - result["sessions_attended"]
-        return self._enrich(result.sort_values("sessions_remaining"), [COL_NAME])
+        va = self._valid_attendances()
+        if va.empty:
+            return pd.DataFrame(columns=[COL_ID, "sessions_attended", "sessions_remaining", "missing"])
+        eligible_ids = set()
+        for pid, group in va.groupby(COL_ID):
+            sessions = group[COL_SESSION].tolist()
+            has_opening = any(self._is_opening(s) for s in sessions)
+            has_closing = any(self._is_closing(s) for s in sessions)
+            others = sum(1 for s in sessions if not self._is_ceremony(s))
+            if has_opening and has_closing and others >= threshold:
+                eligible_ids.add(pid)
+
+        results = []
+        for pid, group in va.groupby(COL_ID):
+            if pid in eligible_ids:
+                continue
+            sessions = group[COL_SESSION].tolist()
+            has_opening = any(self._is_opening(s) for s in sessions)
+            has_closing = any(self._is_closing(s) for s in sessions)
+            others = sum(1 for s in sessions if not self._is_ceremony(s))
+            missing_parts = []
+            remaining = 0
+            if not has_opening:
+                missing_parts.append("Opening")
+                remaining += 1
+            if not has_closing:
+                missing_parts.append("Closing")
+                remaining += 1
+            others_needed = max(0, threshold - others)
+            if others_needed > 0:
+                missing_parts.append(f"+{others_needed} other{'s' if others_needed > 1 else ''}")
+                remaining += others_needed
+            results.append({
+                COL_ID: pid,
+                "sessions_attended": len(sessions),
+                "sessions_remaining": remaining,
+                "missing": ", ".join(missing_parts),
+            })
+        result = pd.DataFrame(results) if results else pd.DataFrame(
+            columns=[COL_ID, "sessions_attended", "sessions_remaining", "missing"])
+        return self._enrich(result.sort_values("sessions_remaining") if not result.empty else result, [COL_NAME])
 
     def lookup(self, pid: str) -> Optional[pd.DataFrame]:
         scans = self.records[self.records[COL_ID] == pid.strip()]
@@ -542,8 +635,33 @@ class AttendanceStore:
     def duplicate_scans(self) -> pd.DataFrame:
         if self.records.empty:
             return pd.DataFrame()
-        d = self.records.groupby([COL_SESSION, COL_ID]).size().reset_index(name="scan_count")
-        return d[d["scan_count"] > 1].sort_values("scan_count", ascending=False)
+
+        recs = self.records.copy()
+        recs["ts"] = pd.to_datetime(recs[COL_TIMESTAMP], errors="coerce")
+        recs = recs.dropna(subset=["ts"]).sort_values([COL_ID, COL_SESSION, "ts"])
+
+        dup_counts = []
+        for (pid, sess), group in recs.groupby([COL_ID, COL_SESSION]):
+            last_valid_ts = None
+            cluster_count = 0
+            total_dups = 0
+            for _, row in group.iterrows():
+                if last_valid_ts is None or (row["ts"] - last_valid_ts).total_seconds() > DUPLICATE_GAP_MINUTES * 60:
+                    total_dups += max(0, cluster_count - 1)
+                    last_valid_ts = row["ts"]
+                    cluster_count = 1
+                else:
+                    cluster_count += 1
+            total_dups += max(0, cluster_count - 1)
+            if total_dups > 0:
+                dup_counts.append({
+                    COL_SESSION: sess, COL_ID: pid,
+                    "scan_count": len(group), "duplicate_count": total_dups,
+                })
+
+        if not dup_counts:
+            return pd.DataFrame()
+        return pd.DataFrame(dup_counts).sort_values("duplicate_count", ascending=False)
 
     def unmatched_ids(self) -> dict:
         if self.registration is None:
@@ -828,16 +946,30 @@ class AttendanceStore:
         year = self.get_year(pid)
         university = self.get_university(pid)
         scans = self.lookup(pid)
-        ns = scans[COL_SESSION].nunique() if scans is not None else 0
-        elig = ns >= threshold
+
+        # Valid attendance count (time-aware deduplication)
+        va = self._valid_attendances()
+        pid_va = va[va[COL_ID] == pid] if not va.empty else pd.DataFrame()
+        ns = len(pid_va)
+
+        # Ceremony-aware eligibility
+        ceremony = self.ceremony_status(pid)
+        others = sum(1 for s in pid_va[COL_SESSION] if not self._is_ceremony(s)) if not pid_va.empty else 0
+        elig = ceremony["opening"] and ceremony["closing"] and others >= threshold
         all_s = self.sessions
 
         scan_rows = ""
         if scans is not None:
-            seen = set()
+            last_scan_ts: dict[str, datetime] = {}
             for i, (_, r) in enumerate(scans.iterrows(), 1):
-                dup = "⚠️ DUP" if r[COL_SESSION] in seen else ""
-                seen.add(r[COL_SESSION])
+                sess = r[COL_SESSION]
+                ts_dt = pd.to_datetime(r[COL_TIMESTAMP], errors="coerce")
+                dup = ""
+                if sess in last_scan_ts and ts_dt is not pd.NaT:
+                    if (ts_dt - last_scan_ts[sess]).total_seconds() <= DUPLICATE_GAP_MINUTES * 60:
+                        dup = "⚠️ DUP"
+                if ts_dt is not pd.NaT:
+                    last_scan_ts[sess] = ts_dt
                 sched_info = ""
                 if self.schedule:
                     ss = self.schedule.get_session_by_name(r[COL_SESSION])
@@ -892,8 +1024,8 @@ td{{padding:8px 12px;border-bottom:1px solid #f1f5f9}}.sessions{{margin-top:12px
 <div class="card"><div class="l">University</div><div class="v">{university or 'N/A'}</div></div>
 <div class="card"><div class="l">Registration IP</div><div class="v">{rip or 'N/A'}</div></div></div>
 <div style="text-align:center;margin:20px 0"><span class="badge {'ok' if elig else 'no'}">
-{'✅ ELIGIBLE' if elig else f'⏳ NOT YET ELIGIBLE — {threshold - ns} more session(s) needed'}</span>
-<div style="margin-top:8px;color:#64748b;font-size:14px">{ns} of {len(all_s)} sessions  •  {len(scans) if scans is not None else 0} scan(s)</div></div>
+{'✅ ELIGIBLE' if elig else '⏳ NOT YET ELIGIBLE'}</span>
+<div style="margin-top:8px;color:#64748b;font-size:14px">{'✅' if ceremony['opening'] else '❌'} Opening  •  {'✅' if ceremony['closing'] else '❌'} Closing  •  {others}/{threshold} others  •  {ns} attendance(s)  •  {len(scans) if scans is not None else 0} scan(s)</div></div>
 <h2>Session Attendance</h2><div class="sessions">{session_dots}</div>
 <h2>Scan History</h2><table><tr><th>#</th><th>Session</th><th>Timestamp</th><th>IP</th><th>Timing</th><th>Flags</th></tr>
 {scan_rows or '<tr><td colspan="6" style="text-align:center;color:#94a3b8">No scans</td></tr>'}</table>
